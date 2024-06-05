@@ -1,4 +1,4 @@
-import { PluginItem } from 'next/dist/compiled/babel/core'
+import type { PluginItem } from 'next/dist/compiled/babel/core'
 import { dirname } from 'path'
 
 const isLoadIntentTest = process.env.NODE_ENV === 'test'
@@ -154,7 +154,12 @@ export default (
         },
       ],
       require('next/dist/compiled/babel/plugin-syntax-dynamic-import'),
-      require('next/dist/compiled/babel/plugin-syntax-import-assertions'),
+      [
+        require('next/dist/compiled/babel/plugin-syntax-import-attributes'),
+        {
+          deprecatedAssertSyntax: true,
+        },
+      ],
       require('./plugins/react-loadable-plugin'),
       [
         require('next/dist/compiled/babel/plugin-proposal-class-properties'),

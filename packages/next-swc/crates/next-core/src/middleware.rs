@@ -1,16 +1,15 @@
 use anyhow::Result;
 use indexmap::indexmap;
-use turbo_tasks::{Value, Vc};
-use turbo_tasks_fs::{File, FileSystemPath};
+use turbo_tasks::{RcStr, Value, Vc};
+use turbo_tasks_fs::FileSystemPath;
 use turbopack_binding::turbopack::core::{
-    asset::AssetContent, context::AssetContext, module::Module, reference_type::ReferenceType,
-    virtual_source::VirtualSource,
+    context::AssetContext, module::Module, reference_type::ReferenceType,
 };
 
-use crate::util::{load_next_js_template, virtual_next_js_template_path};
+use crate::util::load_next_js_template;
 
 #[turbo_tasks::function]
-pub async fn middleware_files(page_extensions: Vc<Vec<String>>) -> Result<Vc<Vec<String>>> {
+pub async fn middleware_files(page_extensions: Vc<Vec<RcStr>>) -> Result<Vc<Vec<RcStr>>> {
     let extensions = page_extensions.await?;
     let files = ["middleware.", "src/middleware."]
         .into_iter()
@@ -18,6 +17,7 @@ pub async fn middleware_files(page_extensions: Vc<Vec<String>>) -> Result<Vc<Vec
             extensions
                 .iter()
                 .map(move |ext| String::from(f) + ext.as_str())
+                .map(RcStr::from)
         })
         .collect();
     Ok(Vc::cell(files))
@@ -29,25 +29,31 @@ pub async fn get_middleware_module(
     project_root: Vc<FileSystemPath>,
     userland_module: Vc<Box<dyn Module>>,
 ) -> Result<Vc<Box<dyn Module>>> {
-    let template_file = "middleware.js";
+    const INNER: &str = "INNER_MIDDLEWARE_MODULE";
 
     // Load the file from the next.js codebase.
-    let file = load_next_js_template(project_root, template_file.to_string()).await?;
-
-    let file = File::from(file.clone_value());
-
-    let template_path = virtual_next_js_template_path(project_root, template_file.to_string());
-
-    let virtual_source = VirtualSource::new(template_path, AssetContent::file(file.into()));
+    let source = load_next_js_template(
+        "middleware.js",
+        project_root,
+        indexmap! {
+            "VAR_USERLAND" => INNER.into(),
+            "VAR_DEFINITION_PAGE" => "/middleware".into(),
+        },
+        indexmap! {},
+        indexmap! {},
+    )
+    .await?;
 
     let inner_assets = indexmap! {
-        "VAR_USERLAND".to_string() => userland_module
+        INNER.into() => userland_module
     };
 
-    let module = context.process(
-        Vc::upcast(virtual_source),
-        Value::new(ReferenceType::Internal(Vc::cell(inner_assets))),
-    );
+    let module = context
+        .process(
+            source,
+            Value::new(ReferenceType::Internal(Vc::cell(inner_assets))),
+        )
+        .module();
 
     Ok(module)
 }

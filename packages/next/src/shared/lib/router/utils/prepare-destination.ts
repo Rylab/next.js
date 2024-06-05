@@ -11,7 +11,7 @@ import { parseUrl } from './parse-url'
 import {
   INTERCEPTION_ROUTE_MARKERS,
   isInterceptionRouteAppPath,
-} from '../../../../server/future/helpers/interception-routes'
+} from '../../../../server/lib/interception-routes'
 import { NEXT_RSC_UNION_QUERY } from '../../../../client/components/app-router-headers'
 import { getCookieParser } from '../../../../server/api-utils/get-cookie-parser'
 
@@ -81,7 +81,7 @@ export function matchHas(
       case 'host': {
         const { host } = req?.headers || {}
         // remove port from host if present
-        const hostname = host?.split(':')[0].toLowerCase()
+        const hostname = host?.split(':', 1)[0].toLowerCase()
         value = hostname
         break
       }
@@ -257,7 +257,7 @@ export function prepareDestination(args: {
   try {
     newUrl = destPathCompiler(args.params)
 
-    const [pathname, hash] = newUrl.split('#')
+    const [pathname, hash] = newUrl.split('#', 2)
     parsedDestination.hostname = destHostnameCompiler(args.params)
     parsedDestination.pathname = pathname
     parsedDestination.hash = `${hash ? '#' : ''}${hash || ''}`

@@ -13,18 +13,13 @@ import {
   WebNextResponse,
 } from '../../../../server/base-http/web'
 import { SERVER_RUNTIME } from '../../../../lib/constants'
-import { PrerenderManifest } from '../../..'
+import type { ManifestRewriteRoute, PrerenderManifest } from '../../..'
 import { normalizeAppPath } from '../../../../shared/lib/router/utils/app-paths'
-import { SizeLimit } from '../../../../../types'
-
-const NEXT_PRIVATE_GLOBAL_WAIT_UNTIL = Symbol.for(
-  '__next_private_global_wait_until__'
-)
-
-// @ts-ignore
-globalThis[NEXT_PRIVATE_GLOBAL_WAIT_UNTIL] =
-  // @ts-ignore
-  globalThis[NEXT_PRIVATE_GLOBAL_WAIT_UNTIL] || []
+import type { SizeLimit } from '../../../../types'
+import { internal_getCurrentFunctionWaitUntil } from '../../../../server/web/internal-edge-wait-until'
+import type { PAGE_TYPES } from '../../../../lib/page-types'
+import type { NextRequestHint } from '../../../../server/web/adapter'
+import type { DeepReadonly } from '../../../../shared/lib/deep-readonly'
 
 export function getRender({
   dev,
@@ -38,17 +33,18 @@ export function getRender({
   buildManifest,
   prerenderManifest,
   reactLoadableManifest,
+  interceptionRouteRewrites,
   renderToHTML,
   clientReferenceManifest,
   subresourceIntegrityManifest,
   serverActionsManifest,
-  serverActionsBodySizeLimit,
+  serverActions,
   config,
   buildId,
   nextFontManifest,
   incrementalCacheHandler,
 }: {
-  pagesType: 'app' | 'pages' | 'root'
+  pagesType: PAGE_TYPES
   dev: boolean
   page: string
   appMod: any
@@ -58,13 +54,16 @@ export function getRender({
   renderToHTML?: any
   Document: DocumentType
   buildManifest: BuildManifest
-  prerenderManifest: PrerenderManifest
+  prerenderManifest: DeepReadonly<PrerenderManifest>
   reactLoadableManifest: ReactLoadableManifest
   subresourceIntegrityManifest?: Record<string, string>
+  interceptionRouteRewrites?: ManifestRewriteRoute[]
   clientReferenceManifest?: ClientReferenceManifest
-  serverActionsManifest: any
-  serverActionsBodySizeLimit?: SizeLimit
-  appServerMod: any
+  serverActionsManifest?: any
+  serverActions?: {
+    bodySizeLimit?: SizeLimit
+    allowedOrigins?: string[]
+  }
   config: NextConfigComplete
   buildId: string
   nextFontManifest: NextFontManifest
@@ -90,13 +89,14 @@ export function getRender({
       pathname: isAppPath ? normalizeAppPath(page) : page,
       pagesType,
       prerenderManifest,
+      interceptionRouteRewrites,
       extendRenderOpts: {
         buildId,
         runtime: SERVER_RUNTIME.experimentalEdge,
-        supportsDynamicHTML: true,
+        supportsDynamicResponse: true,
         disableOptimizedLoading: true,
         serverActionsManifest,
-        serverActionsBodySizeLimit,
+        serverActions,
         nextFontManifest,
       },
       renderToHTML,
@@ -153,23 +153,30 @@ export function getRender({
 
   const handler = server.getRequestHandler()
 
-  return async function render(request: Request, event: NextFetchEvent) {
+  return async function render(
+    request: NextRequestHint,
+    event?: NextFetchEvent
+  ) {
     const extendedReq = new WebNextRequest(request)
-    const extendedRes = new WebNextResponse()
+    const extendedRes = new WebNextResponse(
+      undefined,
+      // tracking onClose adds overhead, so only do it if `experimental.after` is on.
+      !!process.env.__NEXT_AFTER
+    )
 
     handler(extendedReq, extendedRes)
     const result = await extendedRes.toResponse()
 
-    if (event && event.waitUntil) {
-      event.waitUntil(
-        // @ts-ignore
-        Promise.all([...globalThis[NEXT_PRIVATE_GLOBAL_WAIT_UNTIL]])
-      )
+    if (event?.waitUntil) {
+      // TODO(after):
+      // remove `internal_runWithWaitUntil` and the `internal-edge-wait-until` module
+      // when consumers switch to `unstable_after`.
+      const waitUntilPromise = internal_getCurrentFunctionWaitUntil()
+      if (waitUntilPromise) {
+        event.waitUntil(waitUntilPromise)
+      }
     }
 
-    // fetchMetrics is attached to the web request that going through the server,
-    // wait for the handler result is ready and attach it back to the original request.
-    ;(request as any).fetchMetrics = extendedReq.fetchMetrics
     return result
   }
 }

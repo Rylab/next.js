@@ -1,3 +1,4 @@
+import { encodeURIPath } from '../../shared/lib/encode-uri-path'
 import type { BuildManifest } from '../get-page-files'
 
 import ReactDOM from 'react-dom'
@@ -5,13 +6,13 @@ import ReactDOM from 'react-dom'
 export function getRequiredScripts(
   buildManifest: BuildManifest,
   assetPrefix: string,
-  crossOrigin: string | undefined,
+  crossOrigin: undefined | '' | 'anonymous' | 'use-credentials',
   SRIManifest: undefined | Record<string, string>,
   qs: string,
   nonce: string | undefined
 ): [
   () => void,
-  { src: string; integrity?: string; crossOrigin?: string | undefined }
+  { src: string; integrity?: string; crossOrigin?: string | undefined },
 ] {
   let preinitScripts: () => void
   let preinitScriptCommands: string[] = []
@@ -24,7 +25,7 @@ export function getRequiredScripts(
     crossOrigin,
   }
 
-  const files = buildManifest.rootMainFiles
+  const files = buildManifest.rootMainFiles.map(encodeURIPath)
   if (files.length === 0) {
     throw new Error(
       'Invariant: missing bootstrap script. This is a bug in Next.js'

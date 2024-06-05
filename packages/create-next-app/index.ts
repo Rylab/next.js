@@ -5,6 +5,7 @@ import Commander from 'commander'
 import Conf from 'conf'
 import path from 'path'
 import prompts from 'prompts'
+import type { InitialReturnValue } from 'prompts'
 import checkForUpdate from 'update-check'
 import { createApp, DownloadError } from './create-app'
 import { getPkgManager } from './helpers/get-pkg-manager'
@@ -21,7 +22,11 @@ const handleSigTerm = () => process.exit(0)
 process.on('SIGINT', handleSigTerm)
 process.on('SIGTERM', handleSigTerm)
 
-const onPromptState = (state: any) => {
+const onPromptState = (state: {
+  value: InitialReturnValue
+  aborted: boolean
+  exited: boolean
+}) => {
   if (state.aborted) {
     // If we don't re-enable the terminal cursor before exiting
     // the program, the cursor will remain hidden
@@ -81,10 +86,24 @@ const program = new Commander.Command(packageJson.name)
 `
   )
   .option(
+    '--turbo',
+    `
+    
+  Enable Turbopack by default for development.
+`
+  )
+  .option(
     '--import-alias <alias-to-configure>',
     `
 
   Specify import alias to use (default "@/*").
+`
+  )
+  .option(
+    '--empty',
+    `
+
+  Initialize an empty project.
 `
   )
   .option(
@@ -141,18 +160,25 @@ const program = new Commander.Command(packageJson.name)
   Explicitly tell the CLI to reset any stored preferences
 `
   )
+  .option(
+    '--skip-install',
+    `
+
+  Explicitly tell the CLI to skip installing packages
+`
+  )
   .allowUnknownOption()
   .parse(process.argv)
 
 const packageManager = !!program.useNpm
   ? 'npm'
   : !!program.usePnpm
-  ? 'pnpm'
-  : !!program.useYarn
-  ? 'yarn'
-  : !!program.useBun
-  ? 'bun'
-  : getPkgManager()
+    ? 'pnpm'
+    : !!program.useYarn
+      ? 'yarn'
+      : !!program.useBun
+        ? 'bun'
+        : getPkgManager()
 
 async function run(): Promise<void> {
   const conf = new Conf({ projectName: 'create-next-app' })
@@ -179,7 +205,7 @@ async function run(): Promise<void> {
         if (validation.valid) {
           return true
         }
-        return 'Invalid project name: ' + validation.problems![0]
+        return 'Invalid project name: ' + validation.problems[0]
       },
     })
 
@@ -202,15 +228,17 @@ async function run(): Promise<void> {
   const resolvedProjectPath = path.resolve(projectPath)
   const projectName = path.basename(resolvedProjectPath)
 
-  const { valid, problems } = validateNpmName(projectName)
-  if (!valid) {
+  const validation = validateNpmName(projectName)
+  if (!validation.valid) {
     console.error(
       `Could not create a project called ${red(
         `"${projectName}"`
       )} because of npm naming restrictions:`
     )
 
-    problems!.forEach((p) => console.error(`    ${red(bold('*'))} ${p}`))
+    validation.problems.forEach((p) =>
+      console.error(`    ${red(bold('*'))} ${p}`)
+    )
     process.exit(1)
   }
 
@@ -250,6 +278,8 @@ async function run(): Promise<void> {
       srcDir: false,
       importAlias: '@/*',
       customizeImportAlias: false,
+      empty: false,
+      turbo: false,
     }
     const getPrefOrDefault = (field: string) =>
       preferences[field] ?? defaults[field]
@@ -346,7 +376,7 @@ async function run(): Promise<void> {
           onState: onPromptState,
           type: 'toggle',
           name: 'srcDir',
-          message: `Would you like to use ${styledSrcDir}?`,
+          message: `Would you like your code inside a ${styledSrcDir}?`,
           initial: getPrefOrDefault('srcDir'),
           active: 'Yes',
           inactive: 'No',
@@ -374,12 +404,34 @@ async function run(): Promise<void> {
       }
     }
 
+    if (!program.turbo && !process.argv.includes('--no-turbo')) {
+      if (ciInfo.isCI) {
+        program.turbo = getPrefOrDefault('turbo')
+      } else {
+        const styledTurbo = blue('Turbopack')
+        const { turbo } = await prompts({
+          onState: onPromptState,
+          type: 'toggle',
+          name: 'turbo',
+          message: `Would you like to use ${styledTurbo} for ${`next dev`}?`,
+          initial: getPrefOrDefault('turbo'),
+          active: 'Yes',
+          inactive: 'No',
+        })
+        program.turbo = Boolean(turbo)
+        preferences.turbo = Boolean(turbo)
+      }
+    }
+
+    const importAliasPattern = /^[^*"]+\/\*\s*$/
     if (
       typeof program.importAlias !== 'string' ||
-      !program.importAlias.length
+      !importAliasPattern.test(program.importAlias)
     ) {
       if (ciInfo.isCI) {
         // We don't use preferences here because the default value is @/* regardless of existing preferences
+        program.importAlias = defaults.importAlias
+      } else if (process.argv.includes('--no-import-alias')) {
         program.importAlias = defaults.importAlias
       } else {
         const styledImportAlias = blue('import alias')
@@ -388,7 +440,7 @@ async function run(): Promise<void> {
           onState: onPromptState,
           type: 'toggle',
           name: 'customizeImportAlias',
-          message: `Would you like to customize the default ${styledImportAlias} (${defaults.importAlias})?`,
+          message: `Would you like to customize the ${styledImportAlias} (${defaults.importAlias} by default)?`,
           initial: getPrefOrDefault('customizeImportAlias'),
           active: 'Yes',
           inactive: 'No',
@@ -405,7 +457,7 @@ async function run(): Promise<void> {
             message: `What ${styledImportAlias} would you like configured?`,
             initial: getPrefOrDefault('importAlias'),
             validate: (value) =>
-              /.+\/\*/.test(value)
+              importAliasPattern.test(value)
                 ? true
                 : 'Import alias must follow the pattern <prefix>/*',
           })
@@ -428,6 +480,9 @@ async function run(): Promise<void> {
       appRouter: program.app,
       srcDir: program.srcDir,
       importAlias: program.importAlias,
+      skipInstall: program.skipInstall,
+      empty: program.empty,
+      turbo: program.turbo,
     })
   } catch (reason) {
     if (!(reason instanceof DownloadError)) {
@@ -456,6 +511,9 @@ async function run(): Promise<void> {
       appRouter: program.app,
       srcDir: program.srcDir,
       importAlias: program.importAlias,
+      skipInstall: program.skipInstall,
+      empty: program.empty,
+      turbo: program.turbo,
     })
   }
   conf.set('preferences', preferences)
@@ -471,10 +529,10 @@ async function notifyUpdate(): Promise<void> {
         packageManager === 'yarn'
           ? 'yarn global add create-next-app'
           : packageManager === 'pnpm'
-          ? 'pnpm add -g create-next-app'
-          : packageManager === 'bun'
-          ? 'bun add -g create-next-app'
-          : 'npm i -g create-next-app'
+            ? 'pnpm add -g create-next-app'
+            : packageManager === 'bun'
+              ? 'bun add -g create-next-app'
+              : 'npm i -g create-next-app'
 
       console.log(
         yellow(bold('A new version of `create-next-app` is available!')) +

@@ -1,5 +1,4 @@
 import { promises } from 'fs'
-import '../server/node-polyfill-fetch'
 import * as Log from '../build/output/log'
 import findUp from 'next/dist/compiled/find-up'
 // @ts-ignore no-json types
@@ -52,8 +51,8 @@ export async function patchIncorrectLockfile(dir: string) {
   const endingNewline = content.endsWith('\r\n')
     ? '\r\n'
     : content.endsWith('\n')
-    ? '\n'
-    : ''
+      ? '\n'
+      : ''
 
   const lockfileParsed = JSON.parse(content)
   const lockfileVersion = parseInt(lockfileParsed?.lockfileVersion, 10)

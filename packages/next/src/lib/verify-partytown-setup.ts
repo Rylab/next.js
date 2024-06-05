@@ -2,10 +2,8 @@ import { promises } from 'fs'
 import { bold, cyan, red } from './picocolors'
 
 import path from 'path'
-import {
-  hasNecessaryDependencies,
-  NecessaryDependencies,
-} from './has-necessary-dependencies'
+import { hasNecessaryDependencies } from './has-necessary-dependencies'
+import type { NecessaryDependencies } from './has-necessary-dependencies'
 import { fileExists, FileType } from './file-exists'
 import { FatalError } from './fatal-error'
 import * as Log from '../build/output/log'
@@ -28,8 +26,8 @@ async function missingDependencyError(dir: string) {
           (packageManager === 'yarn'
             ? 'yarn add --dev'
             : packageManager === 'pnpm'
-            ? 'pnpm install --save-dev'
-            : 'npm install --save-dev') + ' @builder.io/partytown'
+              ? 'pnpm install --save-dev'
+              : 'npm install --save-dev') + ' @builder.io/partytown'
         )
       )}` +
       '\n\n' +

@@ -7,9 +7,6 @@ import type {
   WorkerRenderOpts,
 } from './types'
 
-// Polyfill fetch for the export worker.
-import '../server/node-polyfill-fetch'
-import '../server/node-polyfill-web-streams'
 import '../server/node-environment'
 
 process.env.NEXT_IS_EXPORT_WORKER = 'true'
@@ -35,6 +32,13 @@ import { exportAppPage } from './routes/app-page'
 import { exportPages } from './routes/pages'
 import { getParams } from './helpers/get-params'
 import { createIncrementalCache } from './helpers/create-incremental-cache'
+import { isPostpone } from '../server/lib/router-utils/is-postpone'
+import { isDynamicUsageError } from './helpers/is-dynamic-usage-error'
+import { isBailoutToCSRError } from '../shared/lib/lazy-dynamic/bailout-to-csr'
+import {
+  turborepoTraceAccess,
+  TurborepoAccessTraceResult,
+} from '../build/turborepo-access-trace'
 
 const envConfig = require('../shared/lib/runtime-config.external')
 
@@ -47,6 +51,7 @@ async function exportPageImpl(
   fileWriter: FileWriter
 ): Promise<ExportRouteResult | undefined> {
   const {
+    dir,
     path,
     pathMap,
     distDir,
@@ -58,18 +63,16 @@ async function exportPageImpl(
     optimizeCss,
     disableOptimizedLoading,
     debugOutput = false,
-    isrMemoryCacheSize,
+    cacheMaxMemorySize,
     fetchCache,
     fetchCacheKeyPrefix,
-    incrementalCacheHandlerPath,
+    cacheHandler,
     enableExperimentalReact,
     ampValidatorPath,
     trailingSlash,
+    enabledDirectories,
   } = input
 
-  if (input.renderOpts.deploymentId) {
-    process.env.NEXT_DEPLOYMENT_ID = input.renderOpts.deploymentId
-  }
   if (enableExperimentalReact) {
     process.env.__NEXT_EXPERIMENTAL_REACT = 'true'
   }
@@ -80,11 +83,12 @@ async function exportPageImpl(
     // Check if this is an `app/` page.
     _isAppDir: isAppDir = false,
 
-    // Check if this is an `app/` prefix request.
-    _isAppPrefetch: isAppPrefetch = false,
-
     // Check if this should error when dynamic usage is detected.
     _isDynamicError: isDynamicError = false,
+
+    // If this page supports partial prerendering, then we need to pass that to
+    // the renderOpts.
+    _isRoutePPREnabled: isRoutePPREnabled,
 
     // Pull the original query out.
     query: originalQuery = {},
@@ -175,7 +179,7 @@ async function exportPageImpl(
           dl.defaultLocale === locale || dl.locales?.includes(locale || '')
       )
     ) {
-      addRequestMeta(req, '__nextIsLocaleDomain', true)
+      addRequestMeta(req, 'isLocaleDomain', true)
     }
 
     envConfig.setConfig({
@@ -220,12 +224,17 @@ async function exportPageImpl(
     // cache instance for this page.
     const incrementalCache =
       isAppDir && fetchCache
-        ? createIncrementalCache(
-            incrementalCacheHandlerPath,
-            isrMemoryCacheSize,
+        ? await createIncrementalCache({
+            cacheHandler,
+            cacheMaxMemorySize,
             fetchCacheKeyPrefix,
-            distDir
-          )
+            distDir,
+            dir,
+            enabledDirectories,
+            // skip writing to disk in minimal mode for now, pending some
+            // changes to better support it
+            flushToDisk: !hasNextSupport,
+          })
         : undefined
 
     // Handle App Routes.
@@ -238,7 +247,8 @@ async function exportPageImpl(
         incrementalCache,
         distDir,
         htmlFilepath,
-        fileWriter
+        fileWriter,
+        input.renderOpts.experimental
       )
     }
 
@@ -256,10 +266,16 @@ async function exportPageImpl(
       optimizeFonts,
       optimizeCss,
       disableOptimizedLoading,
-      fontManifest: optimizeFonts ? requireFontManifest(distDir) : null,
+      fontManifest: optimizeFonts ? requireFontManifest(distDir) : undefined,
       locale,
-      supportsDynamicHTML: false,
+      supportsDynamicResponse: false,
       originalPathname: page,
+      experimental: {
+        ...input.renderOpts.experimental,
+        isRoutePPREnabled,
+      },
+      waitUntil: undefined,
+      onClose: undefined,
     }
 
     if (hasNextSupport) {
@@ -283,7 +299,6 @@ async function exportPageImpl(
         htmlFilepath,
         debugOutput,
         isDynamicError,
-        isAppPrefetch,
         fileWriter
       )
     }
@@ -310,9 +325,11 @@ async function exportPageImpl(
     )
   } catch (err) {
     console.error(
-      `\nError occurred prerendering page "${path}". Read more: https://nextjs.org/docs/messages/prerender-error\n` +
-        (isError(err) && err.stack ? err.stack : err)
+      `\nError occurred prerendering page "${path}". Read more: https://nextjs.org/docs/messages/prerender-error\n`
     )
+    if (!isBailoutToCSRError(err)) {
+      console.error(isError(err) && err.stack ? err.stack : err)
+    }
 
     return { error: true }
   }
@@ -342,10 +359,14 @@ export default async function exportPage(
 
   const start = Date.now()
 
+  const turborepoAccessTraceResult = new TurborepoAccessTraceResult()
   // Export the page.
-  const result = await exportPageSpan.traceAsyncFn(async () => {
-    return await exportPageImpl(input, baseFileWriter)
-  })
+  const result = await exportPageSpan.traceAsyncFn(() =>
+    turborepoTraceAccess(
+      () => exportPageImpl(input, baseFileWriter),
+      turborepoAccessTraceResult
+    )
+  )
 
   // If there was no result, then we can exit early.
   if (!result) return
@@ -363,5 +384,29 @@ export default async function exportPage(
     revalidate: result.revalidate,
     metadata: result.metadata,
     ssgNotFound: result.ssgNotFound,
+    hasEmptyPrelude: result.hasEmptyPrelude,
+    hasPostponed: result.hasPostponed,
+    turborepoAccessTraceResult: turborepoAccessTraceResult.serialize(),
   }
 }
+
+process.on('unhandledRejection', (err: unknown) => {
+  // if it's a postpone error, it'll be handled later
+  // when the postponed promise is actually awaited.
+  if (isPostpone(err)) {
+    return
+  }
+
+  // we don't want to log these errors
+  if (isDynamicUsageError(err)) {
+    return
+  }
+
+  console.error(err)
+})
+
+process.on('rejectionHandled', () => {
+  // It is ok to await a Promise late in Next.js as it allows for better
+  // prefetching patterns to avoid waterfalls. We ignore logging these.
+  // We should've already errored in anyway unhandledRejection.
+})

@@ -5,6 +5,7 @@ import type { RequestStore } from '../../client/components/request-async-storage
 import type { RenderOpts } from '../app-render/types'
 import type { AsyncStorageWrapper } from './async-storage-wrapper'
 import type { NextRequest } from '../web/spec-extension/request'
+import type { __ApiPreviewProps } from '../api-utils'
 
 import { FLIGHT_PARAMETERS } from '../../client/components/app-router-headers'
 import {
@@ -16,9 +17,11 @@ import {
   RequestCookiesAdapter,
   type ReadonlyRequestCookies,
 } from '../web/spec-extension/adapters/request-cookies'
-import { RequestCookies, ResponseCookies } from '../web/spec-extension/cookies'
-import { __ApiPreviewProps } from '../api-utils'
+import { ResponseCookies, RequestCookies } from '../web/spec-extension/cookies'
 import { DraftModeProvider } from './draft-mode-provider'
+import { splitCookiesString } from '../web/utils'
+import { createAfterContext, type AfterContext } from '../after/after-context'
+import type { RequestLifecycleOpts } from '../base-server'
 
 function getHeaders(headers: Headers | IncomingHttpHeaders): ReadonlyHeaders {
   const cleaned = HeadersAdapter.from(headers)
@@ -29,13 +32,6 @@ function getHeaders(headers: Headers | IncomingHttpHeaders): ReadonlyHeaders {
   return HeadersAdapter.seal(cleaned)
 }
 
-function getCookies(
-  headers: Headers | IncomingHttpHeaders
-): ReadonlyRequestCookies {
-  const cookies = new RequestCookies(HeadersAdapter.from(headers))
-  return RequestCookiesAdapter.seal(cookies)
-}
-
 function getMutableCookies(
   headers: Headers | IncomingHttpHeaders,
   onUpdateCookies?: (cookies: string[]) => void
@@ -44,10 +40,21 @@ function getMutableCookies(
   return MutableRequestCookiesAdapter.wrap(cookies, onUpdateCookies)
 }
 
+export type WrapperRenderOpts = Omit<RenderOpts, 'experimental'> &
+  RequestLifecycleOpts &
+  Partial<
+    Pick<
+      RenderOpts,
+      'ComponentMod' // can be undefined in a route handler
+    >
+  > & {
+    experimental: Pick<RenderOpts['experimental'], 'after'>
+  }
+
 export type RequestContext = {
   req: IncomingMessage | BaseNextRequest | NextRequest
   res?: ServerResponse | BaseNextResponse
-  renderOpts?: RenderOpts
+  renderOpts?: WrapperRenderOpts
 }
 
 export const RequestAsyncStorageWrapper: AsyncStorageWrapper<
@@ -75,6 +82,8 @@ export const RequestAsyncStorageWrapper: AsyncStorageWrapper<
       previewProps = (renderOpts as any).previewProps
     }
 
+    const [wrapWithAfter, afterContext] = createAfterWrapper(renderOpts)
+
     function defaultOnUpdateCookies(cookies: string[]) {
       if (res) {
         res.setHeader('Set-Cookie', cookies)
@@ -100,9 +109,34 @@ export const RequestAsyncStorageWrapper: AsyncStorageWrapper<
       },
       get cookies() {
         if (!cache.cookies) {
+          // if middleware is setting cookie(s), then include those in
+          // the initial cached cookies so they can be read in render
+          const requestCookies = new RequestCookies(
+            HeadersAdapter.from(req.headers)
+          )
+
+          if (
+            'x-middleware-set-cookie' in req.headers &&
+            typeof req.headers['x-middleware-set-cookie'] === 'string'
+          ) {
+            const setCookieValue = req.headers['x-middleware-set-cookie']
+            const responseHeaders = new Headers()
+
+            for (const cookie of splitCookiesString(setCookieValue)) {
+              responseHeaders.append('set-cookie', cookie)
+            }
+
+            const responseCookies = new ResponseCookies(responseHeaders)
+
+            // Transfer cookies from ResponseCookies to RequestCookies
+            for (const cookie of responseCookies.getAll()) {
+              requestCookies.set(cookie.name, cookie.value ?? '')
+            }
+          }
+
           // Seal the cookies object that'll freeze out any methods that could
           // mutate the underlying data.
-          cache.cookies = getCookies(req.headers)
+          cache.cookies = RequestCookiesAdapter.seal(requestCookies)
         }
 
         return cache.cookies
@@ -129,8 +163,37 @@ export const RequestAsyncStorageWrapper: AsyncStorageWrapper<
 
         return cache.draftMode
       },
-    }
 
-    return storage.run(store, callback, store)
+      reactLoadableManifest: renderOpts?.reactLoadableManifest || {},
+      assetPrefix: renderOpts?.assetPrefix || '',
+      afterContext,
+    }
+    return wrapWithAfter(store, () => storage.run(store, callback, store))
   },
+}
+
+function createAfterWrapper(
+  renderOpts: WrapperRenderOpts | undefined
+): [
+  wrap: <Result>(requestStore: RequestStore, callback: () => Result) => Result,
+  afterContext: AfterContext | undefined,
+] {
+  const isAfterEnabled = renderOpts?.experimental?.after ?? false
+  if (!renderOpts || !isAfterEnabled) {
+    return [(_, callback) => callback(), undefined]
+  }
+
+  const { waitUntil, onClose } = renderOpts
+  const cacheScope = renderOpts.ComponentMod?.createCacheScope()
+
+  const afterContext = createAfterContext({
+    waitUntil,
+    onClose,
+    cacheScope,
+  })
+
+  const wrap = <Result>(requestStore: RequestStore, callback: () => Result) =>
+    afterContext.run(requestStore, callback)
+
+  return [wrap, afterContext]
 }

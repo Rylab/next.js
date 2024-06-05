@@ -7,9 +7,9 @@ import {
   TEST_PROJECT_NAME,
   TEST_TEAM_NAME,
   TEST_TOKEN,
-} from '../../../scripts/reset-vercel-project.mjs'
+} from '../../../scripts/reset-project.mjs'
 import fetch from 'node-fetch'
-import { Span } from 'next/src/trace'
+import { Span } from 'next/dist/trace'
 
 export class NextDeployInstance extends NextInstance {
   private _cliOutput: string
@@ -22,6 +22,7 @@ export class NextDeployInstance extends NextInstance {
   }
 
   public async setup(parentSpan: Span) {
+    super.setup(parentSpan)
     await super.createTestDir({ parentSpan, skipInstall: true })
 
     // ensure Vercel CLI is installed
@@ -34,11 +35,30 @@ export class NextDeployInstance extends NextInstance {
         stdio: 'inherit',
       })
     }
-    const vercelFlags = ['--scope', TEST_TEAM_NAME]
-    const vercelEnv = { ...process.env, TOKEN: TEST_TOKEN }
+
+    const vercelFlags = []
+
+    // If the team name is available in the environment, use it as the scope.
+    if (TEST_TEAM_NAME) {
+      vercelFlags.push('--scope', TEST_TEAM_NAME)
+    }
+
+    const vercelEnv = { ...process.env }
+
+    // If the token is available in the environment, use it as the token in the
+    // environment.
+    if (TEST_TOKEN) {
+      vercelEnv.TOKEN = TEST_TOKEN
+    }
 
     // create auth file in CI
     if (process.env.NEXT_TEST_JOB) {
+      if (!TEST_TOKEN && !TEST_TEAM_NAME) {
+        throw new Error(
+          'Missing TEST_TOKEN and TEST_TEAM_NAME environment variables for CI'
+        )
+      }
+
       const vcConfigDir = path.join(os.homedir(), '.vercel')
       await fs.ensureDir(vcConfigDir)
       await fs.writeFile(
@@ -88,6 +108,8 @@ export class NextDeployInstance extends NextInstance {
         'NEXT_PRIVATE_TEST_MODE=e2e',
         '--build-env',
         'NEXT_TELEMETRY_DISABLED=1',
+        '--build-env',
+        'VERCEL_NEXT_BUNDLED_SERVER=1',
         ...additionalEnv,
         '--force',
         ...vercelFlags,
@@ -123,25 +145,21 @@ export class NextDeployInstance extends NextInstance {
 
     require('console').log(`Got buildId: ${this._buildId}`)
 
-    const cliOutputRes = await fetch(
-      `https://vercel.com/api/v1/deployments/${this._parsedUrl.hostname}/events?builds=1&direction=backward`,
+    // Use the vercel logs command to get the CLI output from the build.
+    const logs = await execa(
+      'vercel',
+      ['logs', this._url, '--output', 'raw', ...vercelFlags],
       {
-        headers: {
-          Authorization: `Bearer ${TEST_TOKEN}`,
-        },
+        env: vercelEnv,
       }
     )
-
-    if (!cliOutputRes.ok) {
-      throw new Error(
-        `Failed to get build output: ${await cliOutputRes.text()} (${
-          cliOutputRes.status
-        })`
-      )
+    if (logs.exitCode !== 0) {
+      throw new Error(`Failed to get build output logs: ${logs.stderr}`)
     }
-    this._cliOutput = (await cliOutputRes.json())
-      .map((line) => line.text || '')
-      .join('\n')
+
+    // Use the stdout from the logs command as the CLI output. The CLI will
+    // output other unrelated logs to stderr.
+    this._cliOutput = logs.stdout
   }
 
   public get cliOutput() {

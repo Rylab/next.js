@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use turbo_tasks::Vc;
+use turbo_tasks::{RcStr, Vc};
 use turbopack_binding::turbopack::{
     core::module::Module,
     ecmascript::chunk::EcmascriptChunkPlaceable,
@@ -28,6 +28,11 @@ impl NextServerComponentTransition {
 
 #[turbo_tasks::value_impl]
 impl Transition for NextServerComponentTransition {
+    #[turbo_tasks::function]
+    fn process_layer(self: Vc<Self>, layer: Vc<RcStr>) -> Vc<RcStr> {
+        layer
+    }
+
     #[turbo_tasks::function]
     async fn process_module(
         self: Vc<Self>,

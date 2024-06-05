@@ -1,22 +1,25 @@
+use std::collections::BTreeMap;
+
 use anyhow::{bail, Result};
 use indoc::formatdoc;
-use turbo_tasks::{Value, Vc};
+use turbo_tasks::{RcStr, Vc};
 use turbo_tasks_fs::FileSystemPath;
 use turbopack_binding::turbopack::{
     core::{
         asset::{Asset, AssetContent},
-        chunk::{
-            availability_info::AvailabilityInfo, Chunk, ChunkItem, ChunkableModule, ChunkingContext,
-        },
+        chunk::{ChunkItem, ChunkItemExt, ChunkType, ChunkableModule, ChunkingContext},
         ident::AssetIdent,
         module::Module,
         reference::ModuleReferences,
     },
-    ecmascript::chunk::EcmascriptChunkItemExt,
+    ecmascript::{
+        chunk::EcmascriptChunkType,
+        references::esm::{EsmExport, EsmExports},
+    },
     turbopack::ecmascript::{
         chunk::{
-            EcmascriptChunk, EcmascriptChunkItem, EcmascriptChunkItemContent,
-            EcmascriptChunkPlaceable, EcmascriptChunkingContext, EcmascriptExports,
+            EcmascriptChunkItem, EcmascriptChunkItemContent, EcmascriptChunkPlaceable,
+            EcmascriptExports,
         },
         utils::StringifyJs,
     },
@@ -25,8 +28,8 @@ use turbopack_binding::turbopack::{
 use super::server_component_reference::NextServerComponentModuleReference;
 
 #[turbo_tasks::function]
-fn modifier() -> Vc<String> {
-    Vc::cell("Next.js server component".to_string())
+fn modifier() -> Vc<RcStr> {
+    Vc::cell("Next.js server component".into())
 }
 
 #[turbo_tasks::value(shared)]
@@ -74,15 +77,16 @@ impl Asset for NextServerComponentModule {
 #[turbo_tasks::value_impl]
 impl ChunkableModule for NextServerComponentModule {
     #[turbo_tasks::function]
-    fn as_chunk(
+    async fn as_chunk_item(
         self: Vc<Self>,
-        context: Vc<Box<dyn ChunkingContext>>,
-        availability_info: Value<AvailabilityInfo>,
-    ) -> Vc<Box<dyn Chunk>> {
-        Vc::upcast(EcmascriptChunk::new(
-            context,
-            Vc::upcast(self),
-            availability_info,
+        chunking_context: Vc<Box<dyn ChunkingContext>>,
+    ) -> Result<Vc<Box<dyn turbopack_binding::turbopack::core::chunk::ChunkItem>>> {
+        Ok(Vc::upcast(
+            BuildServerComponentChunkItem {
+                chunking_context,
+                inner: self,
+            }
+            .cell(),
         ))
     }
 }
@@ -90,37 +94,36 @@ impl ChunkableModule for NextServerComponentModule {
 #[turbo_tasks::value_impl]
 impl EcmascriptChunkPlaceable for NextServerComponentModule {
     #[turbo_tasks::function]
-    async fn as_chunk_item(
-        self: Vc<Self>,
-        context: Vc<Box<dyn EcmascriptChunkingContext>>,
-    ) -> Result<Vc<Box<dyn EcmascriptChunkItem>>> {
-        Ok(Vc::upcast(
-            BuildServerComponentChunkItem {
-                context,
-                inner: self,
+    fn get_exports(&self) -> Vc<EcmascriptExports> {
+        let exports = BTreeMap::from([(
+            "default".into(),
+            EsmExport::ImportedNamespace(Vc::upcast(NextServerComponentModuleReference::new(
+                Vc::upcast(self.module),
+            ))),
+        )]);
+
+        EcmascriptExports::EsmExports(
+            EsmExports {
+                exports,
+                star_exports: Default::default(),
             }
             .cell(),
-        ))
-    }
-
-    #[turbo_tasks::function]
-    fn get_exports(&self) -> Vc<EcmascriptExports> {
-        // TODO This should be EsmExports
-        EcmascriptExports::Value.cell()
+        )
+        .cell()
     }
 }
 
 #[turbo_tasks::value]
 struct BuildServerComponentChunkItem {
-    context: Vc<Box<dyn EcmascriptChunkingContext>>,
+    chunking_context: Vc<Box<dyn ChunkingContext>>,
     inner: Vc<NextServerComponentModule>,
 }
 
 #[turbo_tasks::value_impl]
 impl EcmascriptChunkItem for BuildServerComponentChunkItem {
     #[turbo_tasks::function]
-    fn chunking_context(&self) -> Vc<Box<dyn EcmascriptChunkingContext>> {
-        self.context
+    fn chunking_context(&self) -> Vc<Box<dyn ChunkingContext>> {
+        self.chunking_context
     }
 
     #[turbo_tasks::function]
@@ -128,7 +131,11 @@ impl EcmascriptChunkItem for BuildServerComponentChunkItem {
         let this = self.await?;
         let inner = this.inner.await?;
 
-        let module_id = inner.module.as_chunk_item(this.context).id().await?;
+        let module_id = inner
+            .module
+            .as_chunk_item(Vc::upcast(this.chunking_context))
+            .id()
+            .await?;
         Ok(EcmascriptChunkItemContent {
             inner_code: formatdoc!(
                 r#"
@@ -155,5 +162,20 @@ impl ChunkItem for BuildServerComponentChunkItem {
     #[turbo_tasks::function]
     fn references(&self) -> Vc<ModuleReferences> {
         self.inner.references()
+    }
+
+    #[turbo_tasks::function]
+    async fn chunking_context(&self) -> Vc<Box<dyn ChunkingContext>> {
+        self.chunking_context
+    }
+
+    #[turbo_tasks::function]
+    fn ty(&self) -> Vc<Box<dyn ChunkType>> {
+        Vc::upcast(Vc::<EcmascriptChunkType>::default())
+    }
+
+    #[turbo_tasks::function]
+    fn module(&self) -> Vc<Box<dyn Module>> {
+        Vc::upcast(self.inner)
     }
 }

@@ -1,23 +1,32 @@
 import React from 'react'
 import { invalidateCacheByRouterState } from './invalidate-cache-by-router-state'
-import {
-  CacheStates,
-  CacheNode,
-} from '../../../shared/lib/app-router-context.shared-runtime'
+import type { CacheNode } from '../../../shared/lib/app-router-context.shared-runtime'
 import type { FlightRouterState } from '../../../server/app-render/types'
 
 describe('invalidateCacheByRouterState', () => {
   it('should invalidate the cache by router state', () => {
     const cache: CacheNode = {
-      status: CacheStates.LAZY_INITIALIZED,
-      data: null,
-      subTreeData: null,
+      lazyData: null,
+      rsc: null,
+      prefetchRsc: null,
+      head: null,
+      layerAssets: null,
+      prefetchLayerAssets: null,
+      prefetchHead: null,
+      loading: null,
       parallelRoutes: new Map(),
+      lazyDataResolved: false,
     }
     const existingCache: CacheNode = {
-      data: null,
-      status: CacheStates.READY,
-      subTreeData: <>Root layout</>,
+      lazyData: null,
+      rsc: <>Root layout</>,
+      prefetchRsc: null,
+      head: null,
+      layerAssets: null,
+      prefetchLayerAssets: null,
+      prefetchHead: null,
+      lazyDataResolved: false,
+      loading: null,
       parallelRoutes: new Map([
         [
           'children',
@@ -25,9 +34,15 @@ describe('invalidateCacheByRouterState', () => {
             [
               'linking',
               {
-                data: null,
-                status: CacheStates.READY,
-                subTreeData: <>Linking</>,
+                lazyData: null,
+                rsc: <>Linking</>,
+                prefetchRsc: null,
+                head: null,
+                layerAssets: null,
+                prefetchLayerAssets: null,
+                prefetchHead: null,
+                lazyDataResolved: false,
+                loading: null,
                 parallelRoutes: new Map([
                   [
                     'children',
@@ -35,9 +50,15 @@ describe('invalidateCacheByRouterState', () => {
                       [
                         '',
                         {
-                          data: null,
-                          status: CacheStates.READY,
-                          subTreeData: <>Page</>,
+                          lazyData: null,
+                          rsc: <>Page</>,
+                          prefetchRsc: null,
+                          head: null,
+                          layerAssets: null,
+                          prefetchLayerAssets: null,
+                          prefetchHead: null,
+                          lazyDataResolved: false,
+                          loading: null,
                           parallelRoutes: new Map(),
                         },
                       ],
@@ -74,9 +95,15 @@ describe('invalidateCacheByRouterState', () => {
     invalidateCacheByRouterState(cache, existingCache, routerState)
 
     const expectedCache: CacheNode = {
-      data: null,
-      status: CacheStates.LAZY_INITIALIZED,
-      subTreeData: null,
+      lazyData: null,
+      rsc: null,
+      prefetchRsc: null,
+      head: null,
+      layerAssets: null,
+      prefetchLayerAssets: null,
+      prefetchHead: null,
+      lazyDataResolved: false,
+      loading: null,
       parallelRoutes: new Map([['children', new Map()]]),
     }
 

@@ -1,5 +1,4 @@
 module.exports = {
-  experimental: {
-    bundlePagesExternals: true,
-  },
+  bundlePagesRouterDependencies: true,
+  serverExternalPackages: ['opted-out-external-package'],
 }

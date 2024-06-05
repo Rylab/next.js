@@ -1,9 +1,7 @@
 use anyhow::Result;
-use turbo_tasks::{ValueToString, Vc};
+use turbo_tasks::{RcStr, ValueToString, Vc};
 use turbopack_binding::turbopack::core::{
-    chunk::{ChunkableModuleReference, ChunkingType, ChunkingTypeOption},
-    module::Module,
-    reference::ModuleReference,
+    chunk::ChunkableModuleReference, module::Module, reference::ModuleReference,
     resolve::ModuleResolveResult,
 };
 
@@ -23,11 +21,14 @@ impl NextServerComponentModuleReference {
 #[turbo_tasks::value_impl]
 impl ValueToString for NextServerComponentModuleReference {
     #[turbo_tasks::function]
-    async fn to_string(&self) -> Result<Vc<String>> {
-        Ok(Vc::cell(format!(
-            "Next.js server component {}",
-            self.asset.ident().to_string().await?
-        )))
+    async fn to_string(&self) -> Result<Vc<RcStr>> {
+        Ok(Vc::cell(
+            format!(
+                "Next.js server component {}",
+                self.asset.ident().to_string().await?
+            )
+            .into(),
+        ))
     }
 }
 
@@ -40,11 +41,4 @@ impl ModuleReference for NextServerComponentModuleReference {
 }
 
 #[turbo_tasks::value_impl]
-impl ChunkableModuleReference for NextServerComponentModuleReference {
-    #[turbo_tasks::function]
-    fn chunking_type(&self) -> Vc<ChunkingTypeOption> {
-        // TODO(alexkirsz) Instead of isolated parallel, have the server component
-        // reference create a new chunk group entirely?
-        Vc::cell(Some(ChunkingType::IsolatedParallel))
-    }
-}
+impl ChunkableModuleReference for NextServerComponentModuleReference {}

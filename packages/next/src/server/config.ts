@@ -4,24 +4,107 @@ import { pathToFileURL } from 'url'
 import findUp from 'next/dist/compiled/find-up'
 import * as Log from '../build/output/log'
 import { CONFIG_FILES, PHASE_DEVELOPMENT_SERVER } from '../shared/lib/constants'
-import {
-  defaultConfig,
-  normalizeConfig,
+import { defaultConfig, normalizeConfig } from './config-shared'
+import type {
   ExperimentalConfig,
   NextConfigComplete,
-  validateConfig,
   NextConfig,
   TurboLoaderItem,
 } from './config-shared'
+
 import { loadWebpackHook } from './config-utils'
-import { ImageConfig, imageConfigDefault } from '../shared/lib/image-config'
+import { imageConfigDefault } from '../shared/lib/image-config'
+import type { ImageConfig } from '../shared/lib/image-config'
 import { loadEnvConfig, updateInitialEnv } from '@next/env'
 import { flushAndExit } from '../telemetry/flush-and-exit'
 import { findRootDir } from '../lib/find-root'
 import { setHttpClientAndAgentOptions } from './setup-http-agent-env'
 import { pathHasPrefix } from '../shared/lib/router/utils/path-has-prefix'
+import { matchRemotePattern } from '../shared/lib/match-remote-pattern'
 
-export { DomainLocale, NextConfig, normalizeConfig } from './config-shared'
+import { ZodParsedType, util as ZodUtil } from 'next/dist/compiled/zod'
+import type { ZodError, ZodIssue } from 'next/dist/compiled/zod'
+import { hasNextSupport } from '../telemetry/ci-info'
+
+export { normalizeConfig } from './config-shared'
+export type { DomainLocale, NextConfig } from './config-shared'
+
+function processZodErrorMessage(issue: ZodIssue) {
+  let message = issue.message
+
+  let path = ''
+
+  if (issue.path.length > 0) {
+    if (issue.path.length === 1) {
+      const identifier = issue.path[0]
+      if (typeof identifier === 'number') {
+        // The first identifier inside path is a number
+        path = `index ${identifier}`
+      } else {
+        path = `"${identifier}"`
+      }
+    } else {
+      // joined path to be shown in the error message
+      path = `"${issue.path.reduce<string>((acc, cur) => {
+        if (typeof cur === 'number') {
+          // array index
+          return `${acc}[${cur}]`
+        }
+        if (cur.includes('"')) {
+          // escape quotes
+          return `${acc}["${cur.replaceAll('"', '\\"')}"]`
+        }
+        // dot notation
+        const separator = acc.length === 0 ? '' : '.'
+        return acc + separator + cur
+      }, '')}"`
+    }
+  }
+
+  if (
+    issue.code === 'invalid_type' &&
+    issue.received === ZodParsedType.undefined
+  ) {
+    // missing key in object
+    return `${path} is missing, expected ${issue.expected}`
+  }
+  if (issue.code === 'invalid_enum_value') {
+    // Remove "Invalid enum value" prefix from zod default error message
+    return `Expected ${ZodUtil.joinValues(issue.options)}, received '${
+      issue.received
+    }' at ${path}`
+  }
+
+  return message + (path ? ` at ${path}` : '')
+}
+
+function normalizeZodErrors(
+  error: ZodError<NextConfig>
+): [errorMessages: string[], shouldExit: boolean] {
+  let shouldExit = false
+  return [
+    error.issues.flatMap((issue) => {
+      const messages = [processZodErrorMessage(issue)]
+      if (issue.path[0] === 'images') {
+        // We exit the build when encountering an error in the images config
+        shouldExit = true
+      }
+
+      if ('unionErrors' in issue) {
+        issue.unionErrors
+          .map(normalizeZodErrors)
+          .forEach(([unionMessages, unionShouldExit]) => {
+            messages.push(...unionMessages)
+            // If any of the union results shows exit the build, we exit the build
+            shouldExit = shouldExit || unionShouldExit
+          })
+      }
+
+      return messages
+    }),
+    shouldExit,
+  ]
+}
 
 export function warnOptionHasBeenDeprecated(
   config: NextConfig,
@@ -49,17 +132,16 @@ export function warnOptionHasBeenDeprecated(
 
 export function warnOptionHasBeenMovedOutOfExperimental(
   config: NextConfig,
-  oldKey: string,
+  oldExperimentalKey: string,
   newKey: string,
   configFileName: string,
   silent: boolean
 ) {
-  if (config.experimental && oldKey in config.experimental) {
+  if (config.experimental && oldExperimentalKey in config.experimental) {
     if (!silent) {
       Log.warn(
-        `\`${oldKey}\` has been moved out of \`experimental\`` +
-          (newKey.includes('.') ? ` and into \`${newKey}\`` : '') +
-          `. Please update your ${configFileName} file accordingly.`
+        `\`experimental.${oldExperimentalKey}\` has been moved to \`${newKey}\`. ` +
+          `Please update your ${configFileName} file accordingly.`
       )
     }
 
@@ -70,7 +152,7 @@ export function warnOptionHasBeenMovedOutOfExperimental(
       current[key] = current[key] || {}
       current = current[key]
     }
-    current[newKeys.shift()!] = (config.experimental as any)[oldKey]
+    current[newKeys.shift()!] = (config.experimental as any)[oldExperimentalKey]
   }
 
   return config
@@ -168,7 +250,25 @@ function assignDefaults(
     {}
   )
 
+  // TODO: remove once we've made PPR default
+  // If this was defaulted to true, it implies that the configuration was
+  // overridden for testing to be defaulted on.
+  if (defaultConfig.experimental?.ppr) {
+    Log.warn(
+      `\`experimental.ppr\` has been defaulted to \`true\` because \`__NEXT_EXPERIMENTAL_PPR\` was set to \`true\` during testing.`
+    )
+  }
+
   const result = { ...defaultConfig, ...config }
+
+  if (
+    result.experimental?.allowDevelopmentBuild &&
+    process.env.NODE_ENV !== 'development'
+  ) {
+    throw new Error(
+      `The experimental.allowDevelopmentBuild option requires NODE_ENV to be explicitly set to 'development'.`
+    )
+  }
 
   if (result.output === 'export') {
     if (result.i18n) {
@@ -176,20 +276,23 @@ function assignDefaults(
         'Specified "i18n" cannot be used with "output: export". See more info here: https://nextjs.org/docs/messages/export-no-i18n'
       )
     }
-    if (result.rewrites) {
-      throw new Error(
-        'Specified "rewrites" cannot be used with "output: export". See more info here: https://nextjs.org/docs/messages/export-no-custom-routes'
-      )
-    }
-    if (result.redirects) {
-      throw new Error(
-        'Specified "redirects" cannot be used with "output: export". See more info here: https://nextjs.org/docs/messages/export-no-custom-routes'
-      )
-    }
-    if (result.headers) {
-      throw new Error(
-        'Specified "headers" cannot be used with "output: export". See more info here: https://nextjs.org/docs/messages/export-no-custom-routes'
-      )
+
+    if (!hasNextSupport) {
+      if (result.rewrites) {
+        Log.warn(
+          'Specified "rewrites" will not automatically work with "output: export". See more info here: https://nextjs.org/docs/messages/export-no-custom-routes'
+        )
+      }
+      if (result.redirects) {
+        Log.warn(
+          'Specified "redirects" will not automatically work with "output: export". See more info here: https://nextjs.org/docs/messages/export-no-custom-routes'
+        )
+      }
+      if (result.headers) {
+        Log.warn(
+          'Specified "headers" will not automatically work with "output: export". See more info here: https://nextjs.org/docs/messages/export-no-custom-routes'
+        )
+      }
     }
   }
 
@@ -263,10 +366,10 @@ function assignDefaults(
       )
     }
 
-    if (images.domains) {
-      if (!Array.isArray(images.domains)) {
+    if (images.remotePatterns) {
+      if (!Array.isArray(images.remotePatterns)) {
         throw new Error(
-          `Specified images.domains should be an Array received ${typeof images.domains}.\nSee more info here: https://nextjs.org/docs/messages/invalid-images-config`
+          `Specified images.remotePatterns should be an Array received ${typeof images.remotePatterns}.\nSee more info here: https://nextjs.org/docs/messages/invalid-images-config`
         )
       }
 
@@ -274,7 +377,33 @@ function assignDefaults(
       // so we need to ensure _next/image allows downloading from
       // this resource
       if (config.assetPrefix?.startsWith('http')) {
-        images.domains.push(new URL(config.assetPrefix).hostname)
+        try {
+          const url = new URL(config.assetPrefix)
+          const hasMatchForAssetPrefix = images.remotePatterns.some((pattern) =>
+            matchRemotePattern(pattern, url)
+          )
+
+          // avoid double-pushing the same remote if it already can be matched
+          if (!hasMatchForAssetPrefix) {
+            images.remotePatterns?.push({
+              hostname: url.hostname,
+              protocol: url.protocol.replace(/:$/, '') as 'http' | 'https',
+              port: url.port,
+            })
+          }
+        } catch (error) {
+          throw new Error(
+            `Invalid assetPrefix provided. Original error: ${error}`
+          )
+        }
+      }
+    }
+
+    if (images.domains) {
+      if (!Array.isArray(images.domains)) {
+        throw new Error(
+          `Specified images.domains should be an Array received ${typeof images.domains}.\nSee more info here: https://nextjs.org/docs/messages/invalid-images-config`
+        )
       }
     }
 
@@ -325,18 +454,18 @@ function assignDefaults(
     }
   }
 
-  // TODO: Remove this warning in Next.js 14
-  warnOptionHasBeenDeprecated(
+  warnOptionHasBeenMovedOutOfExperimental(
     result,
-    'experimental.appDir',
-    'App router is available by default now, `experimental.appDir` option can be safely removed.',
+    'bundlePagesExternals',
+    'bundlePagesRouterDependencies',
+    configFileName,
     silent
   )
-  // TODO: Remove this warning in Next.js 14
-  warnOptionHasBeenDeprecated(
+  warnOptionHasBeenMovedOutOfExperimental(
     result,
-    'experimental.runtime',
-    'You are using `experimental.runtime` which was removed. Check https://nextjs.org/docs/api-routes/edge-api-routes on how to use edge runtime.',
+    'serverComponentsExternalPackages',
+    'serverExternalPackages',
+    configFileName,
     silent
   )
   warnOptionHasBeenMovedOutOfExperimental(
@@ -374,6 +503,13 @@ function assignDefaults(
     configFileName,
     silent
   )
+  warnOptionHasBeenMovedOutOfExperimental(
+    result,
+    'swrDelta',
+    'swrDelta',
+    configFileName,
+    silent
+  )
 
   if ((result.experimental as any).outputStandalone) {
     if (!silent) {
@@ -384,13 +520,15 @@ function assignDefaults(
     result.output = 'standalone'
   }
 
-  if (typeof result.experimental?.serverActionsBodySizeLimit !== 'undefined') {
+  if (
+    typeof result.experimental?.serverActions?.bodySizeLimit !== 'undefined'
+  ) {
     const value = parseInt(
-      result.experimental.serverActionsBodySizeLimit.toString()
+      result.experimental.serverActions?.bodySizeLimit.toString()
     )
     if (isNaN(value) || value < 1) {
       throw new Error(
-        'Server Actions Size Limit must be a valid number or filesize format lager than 1MB: https://nextjs.org/docs/app/api-reference/server-actions#size-limitation'
+        'Server Actions Size Limit must be a valid number or filesize format larger than 1MB: https://nextjs.org/docs/app/api-reference/next-config-js/serverActions#bodysizelimit'
       )
     }
   }
@@ -432,11 +570,8 @@ function assignDefaults(
   }
 
   // only leverage deploymentId
-  if (result.experimental?.useDeploymentId && process.env.NEXT_DEPLOYMENT_ID) {
-    if (!result.experimental) {
-      result.experimental = {}
-    }
-    result.experimental.deploymentId = process.env.NEXT_DEPLOYMENT_ID
+  if (process.env.NEXT_DEPLOYMENT_ID) {
+    result.deploymentId = process.env.NEXT_DEPLOYMENT_ID
   }
 
   // use the closest lockfile as tracing root
@@ -454,15 +589,6 @@ function assignDefaults(
       defaultConfig.experimental.outputFileTracingRoot =
         result.experimental.outputFileTracingRoot
     }
-  }
-
-  if (result.output === 'standalone' && !result.outputFileTracing) {
-    if (!silent) {
-      Log.warn(
-        `"output: 'standalone'" requires outputFileTracing not be disabled please enable it to leverage the standalone build`
-      )
-    }
-    result.output = undefined
   }
 
   setHttpClientAndAgentOptions(result || defaultConfig)
@@ -654,49 +780,8 @@ function assignDefaults(
     '@mui/icons-material': {
       transform: '@mui/icons-material/{{member}}',
     },
-    'date-fns': {
-      transform: 'date-fns/{{member}}',
-    },
     lodash: {
       transform: 'lodash/{{member}}',
-    },
-    'lodash-es': {
-      transform: 'lodash-es/{{member}}',
-    },
-    ramda: {
-      transform: 'ramda/es/{{member}}',
-    },
-    'react-bootstrap': {
-      transform: {
-        useAccordionButton:
-          'modularize-import-loader?name=useAccordionButton&from=named&as=default!react-bootstrap/AccordionButton',
-        '*': 'react-bootstrap/{{member}}',
-      },
-    },
-    antd: {
-      transform: 'antd/lib/{{kebabCase member}}',
-    },
-    ahooks: {
-      transform: {
-        createUpdateEffect:
-          'modularize-import-loader?name=createUpdateEffect&from=named&as=default!ahooks/es/createUpdateEffect',
-        '*': 'ahooks/es/{{member}}',
-      },
-    },
-    '@ant-design/icons': {
-      transform: {
-        IconProvider:
-          'modularize-import-loader?name=IconProvider&from=named&as=default!@ant-design/icons',
-        createFromIconfontCN: '@ant-design/icons/es/components/IconFont',
-        getTwoToneColor:
-          'modularize-import-loader?name=getTwoToneColor&from=named&as=default!@ant-design/icons/es/components/twoTonePrimaryColor',
-        setTwoToneColor:
-          'modularize-import-loader?name=setTwoToneColor&from=named&as=default!@ant-design/icons/es/components/twoTonePrimaryColor',
-        '*': '@ant-design/icons/lib/icons/{{member}}',
-      },
-    },
-    'next/server': {
-      transform: 'next/dist/server/web/exports/{{ kebabCase member }}',
     },
   }
 
@@ -709,6 +794,13 @@ function assignDefaults(
     ...new Set([
       ...userProvidedOptimizePackageImports,
       'lucide-react',
+      'date-fns',
+      'lodash-es',
+      'ramda',
+      'antd',
+      'react-bootstrap',
+      'ahooks',
+      '@ant-design/icons',
       '@headlessui/react',
       '@headlessui-float/react',
       '@heroicons/react/20/solid',
@@ -718,9 +810,30 @@ function assignDefaults(
       '@tremor/react',
       'rxjs',
       '@mui/material',
+      '@mui/icons-material',
       'recharts',
-      '@material-ui/core',
       'react-use',
+      'effect',
+      '@effect/schema',
+      '@effect/platform',
+      '@effect/platform-node',
+      '@effect/platform-browser',
+      '@effect/platform-bun',
+      '@effect/sql',
+      '@effect/sql-mssql',
+      '@effect/sql-mysql2',
+      '@effect/sql-pg',
+      '@effect/sql-squlite-node',
+      '@effect/sql-squlite-bun',
+      '@effect/sql-squlite-wasm',
+      '@effect/sql-squlite-react-native',
+      '@effect/sql-squlite-wasm',
+      '@effect/rpc',
+      '@effect/rpc-http',
+      '@effect/typeclass',
+      '@effect/experimental',
+      '@effect/opentelemetry',
+      '@material-ui/core',
       '@material-ui/icons',
       '@tabler/icons-react',
       'mui-core',
@@ -875,38 +988,36 @@ export default async function loadConfig(
       userConfigModule.default || userConfigModule
     )
 
-    const validateResult = validateConfig(userConfig)
+    if (!process.env.NEXT_MINIMAL) {
+      // We only validate the config against schema in non minimal mode
+      const { configSchema } =
+        require('./config-schema') as typeof import('./config-schema')
+      const state = configSchema.safeParse(userConfig)
 
-    if (validateResult.errors) {
-      // Only load @segment/ajv-human-errors when invalid config is detected
-      const { AggregateAjvError } =
-        require('next/dist/compiled/@segment/ajv-human-errors') as typeof import('next/dist/compiled/@segment/ajv-human-errors')
-      const aggregatedAjvErrors = new AggregateAjvError(validateResult.errors, {
-        fieldLabels: 'js',
-      })
+      if (state.success === false) {
+        // error message header
+        const messages = [`Invalid ${configFileName} options detected: `]
 
-      let shouldExit = false
-      const messages = [`Invalid ${configFileName} options detected: `]
-
-      for (const error of aggregatedAjvErrors) {
-        messages.push(`    ${error.message}`)
-        if (error.message.startsWith('The value at .images.')) {
-          shouldExit = true
+        const [errorMessages, shouldExit] = normalizeZodErrors(state.error)
+        // ident list item
+        for (const error of errorMessages) {
+          messages.push(`    ${error}`)
         }
-      }
 
-      messages.push(
-        'See more info here: https://nextjs.org/docs/messages/invalid-next-config'
-      )
+        // error message footer
+        messages.push(
+          'See more info here: https://nextjs.org/docs/messages/invalid-next-config'
+        )
 
-      if (shouldExit) {
-        for (const message of messages) {
-          console.error(message)
-        }
-        await flushAndExit(1)
-      } else {
-        for (const message of messages) {
-          curLog.warn(message)
+        if (shouldExit) {
+          for (const message of messages) {
+            console.error(message)
+          }
+          await flushAndExit(1)
+        } else {
+          for (const message of messages) {
+            curLog.warn(message)
+          }
         }
       }
     }
@@ -946,6 +1057,18 @@ export default async function loadConfig(
       }
 
       userConfig.experimental.turbo.rules = rules
+    }
+
+    if (userConfig.experimental?.useLightningcss) {
+      const { loadBindings } = require('next/dist/build/swc')
+      const isLightningSupported = (await loadBindings())?.css?.lightning
+
+      if (!isLightningSupported) {
+        curLog.warn(
+          `experimental.useLightningcss is set, but the setting is disabled because next-swc/wasm does not support it yet.`
+        )
+        userConfig.experimental.useLightningcss = false
+      }
     }
 
     onLoadUserConfig?.(userConfig)
@@ -1006,8 +1129,9 @@ export function getEnabledExperimentalFeatures(
       userNextConfigExperimental
     ) as (keyof ExperimentalConfig)[]) {
       if (
+        featureName in defaultConfig.experimental &&
         userNextConfigExperimental[featureName] !==
-        defaultConfig.experimental[featureName]
+          defaultConfig.experimental[featureName]
       ) {
         enabledExperiments.push(featureName)
       }

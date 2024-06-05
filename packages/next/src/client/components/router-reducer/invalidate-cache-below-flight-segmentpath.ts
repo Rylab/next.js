@@ -47,10 +47,14 @@ export function invalidateCacheBelowFlightSegmentPath(
 
   if (childCacheNode === existingChildCacheNode) {
     childCacheNode = {
-      status: childCacheNode.status,
-      data: childCacheNode.data,
-      subTreeData: childCacheNode.subTreeData,
+      lazyData: childCacheNode.lazyData,
+      rsc: childCacheNode.rsc,
+      prefetchRsc: childCacheNode.prefetchRsc,
+      head: childCacheNode.head,
+      layerAssets: childCacheNode.layerAssets,
+      prefetchHead: childCacheNode.prefetchHead,
       parallelRoutes: new Map(childCacheNode.parallelRoutes),
+      lazyDataResolved: childCacheNode.lazyDataResolved,
     } as CacheNode
     childSegmentMap.set(cacheKey, childCacheNode)
   }
